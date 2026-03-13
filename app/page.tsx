@@ -5,17 +5,18 @@ import { GoogleGenAI } from '@google/genai';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { motion, AnimatePresence } from 'motion/react';
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { Panel, Group, Separator } from 'react-resizable-panels';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import { Command } from 'cmdk';
+import { parsePdf } from './actions/pdf';
 import { ingestUrl } from './actions/ingest';
 
 import {
   FileText, MessageSquare, Plus, X, Search,
   PanelLeftClose, PanelLeftOpen, Send, Loader2, Sparkles,
-  AlignLeft, Terminal, FileCode, Check, Trash2, Edit3, Link as LinkIcon,
-  GripVertical
+  AlignLeft, Terminal, FileCode, Check, Trash2, Edit3,
+  GripVertical, FileUp
 } from 'lucide-react';
 
 // --- Types ---
@@ -23,8 +24,7 @@ type Source = {
   id: string;
   title: string;
   content: string;
-  type: 'text' | 'markdown' | 'url';
-  url?: string;
+  type: 'text' | 'markdown' | 'pdf' | 'url';
 };
 
 type Message = {
@@ -47,24 +47,52 @@ export default function ContextEngine() {
   // Modals
   const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
-  const [sourceType, setSourceType] = useState<'text' | 'url'>('text');
+  const [sourceType, setSourceType] = useState<'text' | 'pdf' | 'url'>('text');
+  const [newSourceUrl, setNewSourceUrl] = useState('');
   const [newSourceTitle, setNewSourceTitle] = useState('');
   const [newSourceContent, setNewSourceContent] = useState('');
-  const [newSourceUrl, setNewSourceUrl] = useState('');
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
   const [isIngesting, setIsIngesting] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const commandInputRef = useRef<HTMLInputElement>(null);
 
   // Tiptap Editor
   const editor = useEditor({
     extensions: [StarterKit],
     content: '<h1>Untitled Document</h1><p>Start typing here...</p>',
+    immediatelyRender: false,
     editorProps: {
       attributes: {
         class: 'prose prose-sm sm:prose lg:prose-lg xl:prose-2xl mx-auto focus:outline-none max-w-none',
       },
     },
+    onUpdate: ({ editor }) => {
+      localStorage.setItem('context-engine-editor', editor.getHTML());
+    }
   });
+
+  // Load from LocalStorage
+  useEffect(() => {
+    const savedSources = localStorage.getItem('context-engine-sources');
+    const savedChat = localStorage.getItem('context-engine-chat');
+    const savedEditor = localStorage.getItem('context-engine-editor');
+
+    if (savedSources) setSources(JSON.parse(savedSources));
+    if (savedChat) setChatHistory(JSON.parse(savedChat));
+    if (savedEditor && editor && !editor.isDestroyed) {
+      editor.commands.setContent(savedEditor);
+    }
+  }, [editor]);
+
+  // Save to LocalStorage
+  useEffect(() => {
+    localStorage.setItem('context-engine-sources', JSON.stringify(sources));
+  }, [sources]);
+
+  useEffect(() => {
+    localStorage.setItem('context-engine-chat', JSON.stringify(chatHistory));
+  }, [chatHistory]);
 
   // Scroll chat to bottom
   useEffect(() => {
@@ -78,10 +106,21 @@ export default function ContextEngine() {
         e.preventDefault();
         setIsCommandPaletteOpen((prev) => !prev);
       }
+      if (e.key === 'Escape') {
+        setIsCommandPaletteOpen(false);
+        setIsAddSourceOpen(false);
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
+
+  // Focus command input when opened
+  useEffect(() => {
+    if (isCommandPaletteOpen) {
+      setTimeout(() => commandInputRef.current?.focus(), 50);
+    }
+  }, [isCommandPaletteOpen]);
 
   // --- Gemini Integration ---
   const getGeminiClient = () => {
@@ -155,7 +194,18 @@ export default function ContextEngine() {
 
     try {
       const ai = getGeminiClient();
-      const editorContext = editor ? `\n\nCURRENT EDITOR CONTENT:\n${editor.getText()}` : '';
+      
+      // For "Explain Highlighted Code", we need the selected text
+      let editorContext = '';
+      if (editor) {
+        const { from, to } = editor.state.selection;
+        const selectedText = editor.state.doc.textBetween(from, to, ' ');
+        if (selectedText) {
+          editorContext = `\n\nCURRENTLY HIGHLIGHTED TEXT IN EDITOR:\n${selectedText}`;
+        } else {
+          editorContext = `\n\nCURRENT EDITOR CONTENT:\n${editor.getText()}`;
+        }
+      }
       
       const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
@@ -195,6 +245,31 @@ export default function ContextEngine() {
         type: 'text'
       };
       setSources([...sources, newSource]);
+    } else if (sourceType === 'pdf') {
+      if (!pdfFile) return;
+      setIsIngesting(true);
+      try {
+        const formData = new FormData();
+        formData.append('file', pdfFile);
+        
+        const result = await parsePdf(formData);
+        if (result.success && result.content) {
+          const newSource: Source = {
+            id: Date.now().toString(),
+            title: newSourceTitle.trim() || result.title || 'PDF Document',
+            content: result.content,
+            type: 'pdf'
+          };
+          setSources([...sources, newSource]);
+        } else {
+          alert(`Failed to parse PDF: ${result.error}`);
+        }
+      } catch (error) {
+        console.error(error);
+        alert('Failed to parse PDF');
+      } finally {
+        setIsIngesting(false);
+      }
     } else if (sourceType === 'url') {
       if (!newSourceUrl.trim()) return;
       setIsIngesting(true);
@@ -203,10 +278,9 @@ export default function ContextEngine() {
         if (result.success && result.content) {
           const newSource: Source = {
             id: Date.now().toString(),
-            title: result.title || newSourceUrl,
+            title: newSourceTitle.trim() || result.title || newSourceUrl,
             content: result.content,
-            type: 'url',
-            url: newSourceUrl
+            type: 'url'
           };
           setSources([...sources, newSource]);
         } else {
@@ -223,6 +297,7 @@ export default function ContextEngine() {
     setNewSourceTitle('');
     setNewSourceContent('');
     setNewSourceUrl('');
+    setPdfFile(null);
     setIsAddSourceOpen(false);
   };
 
@@ -232,6 +307,11 @@ export default function ContextEngine() {
 
   const clearSession = () => {
     setChatHistory([{ id: '1', role: 'model', text: 'Session cleared. How can I help you now?' }]);
+    setSources([]);
+    if (editor) editor.commands.setContent('<h1>Untitled Document</h1><p>Start typing here...</p>');
+    localStorage.removeItem('context-engine-sources');
+    localStorage.removeItem('context-engine-chat');
+    localStorage.removeItem('context-engine-editor');
     setIsCommandPaletteOpen(false);
   };
 
@@ -269,8 +349,8 @@ export default function ContextEngine() {
                 sources.map((source) => (
                   <div key={source.id} className="bg-slate-800 rounded-lg p-3 border border-slate-700 group relative">
                     <div className="flex items-start gap-3">
-                      {source.type === 'url' ? (
-                        <LinkIcon className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
+                      {source.type === 'pdf' ? (
+                        <FileUp className="w-4 h-4 text-amber-400 mt-0.5 flex-shrink-0" />
                       ) : (
                         <FileText className="w-4 h-4 text-emerald-400 mt-0.5 flex-shrink-0" />
                       )}
@@ -333,7 +413,7 @@ export default function ContextEngine() {
 
         {/* Split Pane using react-resizable-panels */}
         <div className="flex-1 overflow-hidden">
-          <PanelGroup direction="horizontal">
+          <Group orientation="horizontal">
             {/* Left: Editor */}
             <Panel defaultSize={60} minSize={30}>
               <div className="h-full flex flex-col bg-white">
@@ -348,9 +428,9 @@ export default function ContextEngine() {
               </div>
             </Panel>
 
-            <PanelResizeHandle className="w-2 bg-slate-100 hover:bg-indigo-100 transition-colors flex items-center justify-center cursor-col-resize border-x border-slate-200">
+            <Separator className="w-2 bg-slate-100 hover:bg-indigo-100 transition-colors flex items-center justify-center cursor-col-resize border-x border-slate-200">
               <GripVertical className="w-4 h-4 text-slate-400" />
-            </PanelResizeHandle>
+            </Separator>
 
             {/* Right: Chat */}
             <Panel defaultSize={40} minSize={25}>
@@ -411,7 +491,7 @@ export default function ContextEngine() {
                 </div>
               </div>
             </Panel>
-          </PanelGroup>
+          </Group>
         </div>
       </div>
 
@@ -439,20 +519,20 @@ export default function ContextEngine() {
                     <Command.Empty>No results found.</Command.Empty>
                     
                     <Command.Group heading="Context Actions">
-                      <Command.Item onSelect={() => executeAICommand('Please provide a comprehensive summary of all the sources provided.', 'chat')}>
+                      <Command.Item onSelect={() => executeAICommand('Please provide a comprehensive summary of the left pane editor content and the active sources.', 'chat')}>
                         <AlignLeft className="w-4 h-4" />
-                        /summarize (Summarize active sources)
+                        /summarize (Summarize Left Pane)
                       </Command.Item>
-                      <Command.Item onSelect={() => executeAICommand('Draft a compelling introduction or outline based on the sources provided. Output ONLY the markdown text.', 'append_editor')}>
+                      <Command.Item onSelect={() => executeAICommand('Generate a detailed outline based on the sources provided. Output ONLY the markdown text for the outline.', 'append_editor')}>
                         <Edit3 className="w-4 h-4" />
-                        /draft (Generate blog post outline in editor)
+                        /outline (Generate Outline)
                       </Command.Item>
                     </Command.Group>
 
                     <Command.Group heading="Editor Actions">
-                      <Command.Item onSelect={() => executeAICommand('Review the CURRENT EDITOR CONTENT for grammar, spelling, and clarity. Return the corrected markdown text.', 'replace_editor')}>
-                        <Sparkles className="w-4 h-4" />
-                        /fix-grammar (Fix current editor content)
+                      <Command.Item onSelect={() => executeAICommand('Explain the highlighted code or text in simple terms.', 'chat')}>
+                        <Terminal className="w-4 h-4" />
+                        /explain (Explain Highlighted Code)
                       </Command.Item>
                     </Command.Group>
 
@@ -506,10 +586,17 @@ export default function ContextEngine() {
                   </button>
                   <button
                     type="button"
+                    onClick={() => setSourceType('pdf')}
+                    className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${sourceType === 'pdf' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  >
+                    PDF Upload
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setSourceType('url')}
                     className={`flex-1 py-1.5 text-sm font-medium rounded-md transition-colors ${sourceType === 'url' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
                   >
-                    URL Scraper
+                    Web URL
                   </button>
                 </div>
 
@@ -537,21 +624,59 @@ export default function ContextEngine() {
                       />
                     </div>
                   </>
+                ) : sourceType === 'pdf' ? (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Source Title (Optional)</label>
+                      <input 
+                        type="text" 
+                        value={newSourceTitle}
+                        onChange={(e) => setNewSourceTitle(e.target.value)}
+                        placeholder="e.g., Q1 Financial Report" 
+                        className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Upload PDF</label>
+                      <input 
+                        type="file" 
+                        accept=".pdf"
+                        required
+                        onChange={(e) => setPdfFile(e.target.files?.[0] || null)}
+                        className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
+                      />
+                      <p className="text-xs text-slate-500 mt-2">
+                        We will extract the text from this PDF to use as context.
+                      </p>
+                    </div>
+                  </>
                 ) : (
-                  <div>
-                    <label className="block text-sm font-medium text-slate-700 mb-1">Website URL</label>
-                    <input 
-                      type="url" 
-                      required
-                      value={newSourceUrl}
-                      onChange={(e) => setNewSourceUrl(e.target.value)}
-                      placeholder="https://example.com/article" 
-                      className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
-                    />
-                    <p className="text-xs text-slate-500 mt-2">
-                      We will scrape the main text content from this URL to use as context.
-                    </p>
-                  </div>
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Source Title (Optional)</label>
+                      <input 
+                        type="text" 
+                        value={newSourceTitle}
+                        onChange={(e) => setNewSourceTitle(e.target.value)}
+                        placeholder="e.g., Next.js Documentation" 
+                        className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 mb-1">Web URL</label>
+                      <input 
+                        type="url" 
+                        required
+                        value={newSourceUrl}
+                        onChange={(e) => setNewSourceUrl(e.target.value)}
+                        placeholder="https://example.com/article" 
+                        className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
+                      />
+                      <p className="text-xs text-slate-500 mt-2">
+                        We will scrape the main text content from this URL.
+                      </p>
+                    </div>
+                  </>
                 )}
 
                 <div className="flex justify-end gap-3 mt-2">
@@ -568,7 +693,7 @@ export default function ContextEngine() {
                     className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-400 rounded-lg transition-colors shadow-sm flex items-center gap-2"
                   >
                     {isIngesting ? (
-                      <><Loader2 className="w-4 h-4 animate-spin" /> Scraping...</>
+                      <><Loader2 className="w-4 h-4 animate-spin" /> Parsing...</>
                     ) : (
                       <><Check className="w-4 h-4" /> Save Source</>
                     )}
