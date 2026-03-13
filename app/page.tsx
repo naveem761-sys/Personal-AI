@@ -1,284 +1,533 @@
 'use client';
 
-import React from 'react';
-import { motion } from 'motion/react';
+import React, { useState, useEffect, useRef } from 'react';
+import { GoogleGenAI } from '@google/genai';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { motion, AnimatePresence } from 'motion/react';
 import {
-  Database,
-  Bot,
-  User,
-  LayoutTemplate,
-  Code,
-  UploadCloud,
-  Globe,
-  Smartphone,
-  MessageSquare,
-  Lock,
-  RefreshCw,
-  Eye,
-  Edit3,
-  BrainCircuit,
-  Activity
+  FileText, MessageSquare, Plus, X, Search,
+  PanelLeftClose, PanelLeftOpen, Send, Loader2, Sparkles,
+  AlignLeft, Terminal, FileCode, Check, Trash2, Edit3
 } from 'lucide-react';
 
-const Card = ({ children, className = '' }: { children: React.ReactNode; className?: string }) => (
-  <div className={`bg-white rounded-xl shadow-sm border border-slate-200 p-4 ${className}`}>
-    {children}
-  </div>
-);
-
-const FlowArrow = ({ direction = 'right', className = '' }: { direction?: 'right' | 'down' | 'up' | 'left', className?: string }) => {
-  return (
-    <div className={`flex items-center justify-center text-slate-400 ${className}`}>
-      {direction === 'right' && <span className="text-xl font-bold">→</span>}
-      {direction === 'down' && <span className="text-xl font-bold">↓</span>}
-      {direction === 'up' && <span className="text-xl font-bold">↑</span>}
-      {direction === 'left' && <span className="text-xl font-bold">←</span>}
-    </div>
-  );
+// --- Types ---
+type Source = {
+  id: string;
+  title: string;
+  content: string;
+  type: 'text' | 'markdown' | 'url';
 };
 
-const StepNode = ({ icon: Icon, title, subtitle, color = 'blue', className = '' }: { icon: any, title: string, subtitle?: string, color?: 'blue' | 'emerald' | 'amber' | 'slate' | 'indigo', className?: string }) => {
-  const colorClasses = {
-    blue: 'bg-blue-50 text-blue-600 border-blue-200 shadow-blue-100',
-    emerald: 'bg-emerald-50 text-emerald-600 border-emerald-200 shadow-emerald-100',
-    amber: 'bg-amber-50 text-amber-600 border-amber-200 shadow-amber-100',
-    slate: 'bg-slate-50 text-slate-600 border-slate-200 shadow-slate-100',
-    indigo: 'bg-indigo-50 text-indigo-600 border-indigo-200 shadow-indigo-100',
+type Message = {
+  id: string;
+  role: 'user' | 'model';
+  text: string;
+};
+
+type CommandAction = {
+  id: string;
+  title: string;
+  icon: React.ElementType;
+  action: () => void;
+};
+
+// --- Main Component ---
+export default function ContextEngine() {
+  // State
+  const [sources, setSources] = useState<Source[]>([]);
+  const [editorContent, setEditorContent] = useState<string>('# Untitled Document\n\nStart typing here...');
+  const [chatHistory, setChatHistory] = useState<Message[]>([
+    { id: '1', role: 'model', text: 'Hello! I am your Context Engine. Add some sources to the left, and I will use them to answer your questions or help you draft content.' }
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  
+  // Modals
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = useState(false);
+  const [isAddSourceOpen, setIsAddSourceOpen] = useState(false);
+  const [newSourceTitle, setNewSourceTitle] = useState('');
+  const [newSourceContent, setNewSourceContent] = useState('');
+
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const commandInputRef = useRef<HTMLInputElement>(null);
+
+  // Scroll chat to bottom
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatHistory]);
+
+  // Cmd+K Listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        setIsCommandPaletteOpen((prev) => !prev);
+      }
+      if (e.key === 'Escape') {
+        setIsCommandPaletteOpen(false);
+        setIsAddSourceOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Focus command input when opened
+  useEffect(() => {
+    if (isCommandPaletteOpen) {
+      setTimeout(() => commandInputRef.current?.focus(), 50);
+    }
+  }, [isCommandPaletteOpen]);
+
+  // --- Gemini Integration ---
+  const getGeminiClient = () => {
+    const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+    if (!apiKey) throw new Error('Gemini API Key is missing.');
+    return new GoogleGenAI({ apiKey });
   };
 
+  const buildSystemInstruction = () => {
+    if (sources.length === 0) return "You are a helpful AI assistant.";
+    
+    let instruction = "You are an expert AI assistant acting as a 'Context Engine'. You have access to the following user-provided sources. ALWAYS use these sources to inform your answers. If the answer is not in the sources, say so, but try to be helpful.\n\n";
+    
+    sources.forEach((s, i) => {
+      instruction += `--- SOURCE ${i + 1}: ${s.title} ---\n${s.content}\n\n`;
+    });
+    
+    return instruction;
+  };
+
+  const handleSendMessage = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!chatInput.trim() || isChatLoading) return;
+
+    const userMsg = chatInput.trim();
+    setChatInput('');
+    setChatHistory((prev) => [...prev, { id: Date.now().toString(), role: 'user', text: userMsg }]);
+    setIsChatLoading(true);
+
+    try {
+      const ai = getGeminiClient();
+      const chat = ai.chats.create({
+        model: 'gemini-3.1-pro-preview',
+        config: {
+          systemInstruction: buildSystemInstruction(),
+        }
+      });
+
+      // Replay history (excluding the very first welcome message if we want, but let's just send the new one for simplicity in MVP, or send history)
+      // For a true chat, we'd pass history. The SDK handles history internally if we keep the `chat` instance, 
+      // but since we recreate it, we should ideally pass history. For MVP, we'll just send the current message 
+      // and rely on the system instruction for context.
+      
+      const response = await chat.sendMessage({ message: userMsg });
+      
+      setChatHistory((prev) => [...prev, { 
+        id: (Date.now() + 1).toString(), 
+        role: 'model', 
+        text: response.text || 'No response.' 
+      }]);
+    } catch (error: any) {
+      console.error('Chat Error:', error);
+      setChatHistory((prev) => [...prev, { 
+        id: (Date.now() + 1).toString(), 
+        role: 'model', 
+        text: `Error: ${error.message}` 
+      }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  const executeAICommand = async (prompt: string, actionType: 'append_editor' | 'replace_editor' | 'chat') => {
+    setIsCommandPaletteOpen(false);
+    setIsChatLoading(true);
+    
+    if (actionType === 'chat') {
+      setChatHistory((prev) => [...prev, { id: Date.now().toString(), role: 'user', text: prompt }]);
+    }
+
+    try {
+      const ai = getGeminiClient();
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: prompt,
+        config: {
+          systemInstruction: buildSystemInstruction() + `\n\nCURRENT EDITOR CONTENT:\n${editorContent}`,
+        }
+      });
+
+      const text = response.text || '';
+
+      if (actionType === 'append_editor') {
+        setEditorContent((prev) => prev + '\n\n' + text);
+      } else if (actionType === 'replace_editor') {
+        setEditorContent(text);
+      } else {
+        setChatHistory((prev) => [...prev, { id: Date.now().toString(), role: 'model', text }]);
+      }
+    } catch (error: any) {
+      console.error('Command Error:', error);
+      alert(`Error executing command: ${error.message}`);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  // --- Actions ---
+  const handleAddSource = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newSourceTitle.trim() || !newSourceContent.trim()) return;
+    
+    const newSource: Source = {
+      id: Date.now().toString(),
+      title: newSourceTitle,
+      content: newSourceContent,
+      type: 'text'
+    };
+    
+    setSources([...sources, newSource]);
+    setNewSourceTitle('');
+    setNewSourceContent('');
+    setIsAddSourceOpen(false);
+  };
+
+  const removeSource = (id: string) => {
+    setSources(sources.filter(s => s.id !== id));
+  };
+
+  const commands: CommandAction[] = [
+    {
+      id: 'summarize',
+      title: 'Summarize All Sources',
+      icon: AlignLeft,
+      action: () => executeAICommand('Please provide a comprehensive summary of all the sources provided.', 'chat')
+    },
+    {
+      id: 'draft_intro',
+      title: 'Draft Intro in Editor',
+      icon: Edit3,
+      action: () => executeAICommand('Draft a compelling introduction based on the sources provided. Output ONLY the markdown text for the introduction.', 'append_editor')
+    },
+    {
+      id: 'fix_grammar',
+      title: 'Fix Grammar in Editor',
+      icon: Sparkles,
+      action: () => executeAICommand('Review the CURRENT EDITOR CONTENT for grammar, spelling, and clarity. Return the corrected markdown text. Do not add conversational filler, just return the corrected text.', 'replace_editor')
+    },
+    {
+      id: 'explain_code',
+      title: 'Explain Code (Chat)',
+      icon: Terminal,
+      action: () => executeAICommand('Explain the code or technical concepts present in the sources in simple terms.', 'chat')
+    }
+  ];
+
   return (
-    <motion.div
-      whileHover={{ scale: 1.05, y: -2 }}
-      className={`flex flex-col items-center justify-center p-3 rounded-xl border shadow-sm text-center ${colorClasses[color]} min-w-[120px] ${className}`}
-    >
-      <Icon className="w-6 h-6 mb-2" />
-      <span className="text-xs font-bold uppercase tracking-wider">{title}</span>
-      {subtitle && <span className="text-[10px] opacity-80 mt-1 font-medium">{subtitle}</span>}
-    </motion.div>
-  );
-};
-
-export default function OpenBrainArchitecture() {
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans p-4 md:p-8 overflow-x-hidden">
-      <div className="max-w-7xl mx-auto space-y-8">
-        {/* Header */}
-        <header className="text-center space-y-4 mb-12">
-          <motion.h1 
-            initial={{ opacity: 0, y: -20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="text-3xl md:text-5xl font-extrabold tracking-tight text-slate-900"
+    <div className="flex h-screen bg-slate-50 text-slate-900 font-sans overflow-hidden">
+      
+      {/* --- Sidebar (Sources) --- */}
+      <AnimatePresence initial={false}>
+        {isSidebarOpen && (
+          <motion.div 
+            initial={{ width: 0, opacity: 0 }}
+            animate={{ width: 280, opacity: 1 }}
+            exit={{ width: 0, opacity: 0 }}
+            className="h-full bg-slate-900 text-slate-300 flex flex-col border-r border-slate-800 flex-shrink-0"
           >
-            Open Brain System Architecture
-          </motion.h1>
-          <motion.p 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ delay: 0.2 }}
-            className="text-lg text-slate-600 max-w-3xl mx-auto font-medium"
-          >
-            A lightweight, &quot;Single Source of Truth&quot; model with no middleware, no sync layer, and no export layer between the AI and the human interface.
-          </motion.p>
-        </header>
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          {/* Left Column: Initial Setup */}
-          <div className="lg:col-span-5 space-y-6">
-            <h2 className="text-xl font-bold text-slate-800 border-b-2 border-slate-200 pb-2 flex items-center gap-2">
-              <User className="w-6 h-6 text-amber-500" />
-              Initial Setup (User Action)
-            </h2>
-
-            <Card className="bg-gradient-to-br from-white to-slate-50 border-slate-200 shadow-md hover:shadow-lg transition-shadow">
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">1. Database & UI Generation</h3>
-              <div className="flex flex-wrap items-center gap-2">
-                <StepNode icon={Database} title="Create Table" subtitle="Supabase (Structured)" color="emerald" />
-                <FlowArrow />
-                <StepNode icon={Bot} title="Prompt AI" subtitle="Claude/ChatGPT" color="indigo" />
-                <FlowArrow />
-                <StepNode icon={LayoutTemplate} title="Iterate UI" subtitle="Preview" color="amber" />
-                <FlowArrow />
-                <StepNode icon={Code} title="Receive Code" subtitle="HTML/CSS/JS" color="slate" />
+            <div className="p-4 flex items-center justify-between border-b border-slate-800">
+              <div className="flex items-center gap-2 font-bold text-white">
+                <Database className="w-5 h-5 text-indigo-400" />
+                <span>Context Sources</span>
               </div>
-            </Card>
-
-            <Card className="bg-gradient-to-br from-white to-slate-50 border-slate-200 shadow-md hover:shadow-lg transition-shadow">
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">2. Web App Dashboard Creation</h3>
-              <div className="flex flex-wrap items-center gap-2">
-                <StepNode icon={UploadCloud} title="Upload Code" subtitle="To Vercel" color="blue" />
-                <FlowArrow />
-                <StepNode icon={Globe} title="Vercel Hosting" subtitle="Deployment" color="slate" />
-                <FlowArrow />
-                <StepNode icon={LayoutTemplate} title="Live URL" subtitle="Receive Link" color="emerald" />
-              </div>
-            </Card>
-
-            <Card className="bg-gradient-to-br from-white to-slate-50 border-slate-200 shadow-md hover:shadow-lg transition-shadow">
-              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">3. Deployment & Access</h3>
-              <div className="flex flex-wrap items-center gap-2">
-                <StepNode icon={Globe} title="Live URL" color="emerald" />
-                <FlowArrow />
-                <StepNode icon={Smartphone} title="Bookmark" subtitle="Phone/Device" color="amber" />
-                <FlowArrow />
-                <StepNode icon={LayoutTemplate} title="Dashboard" subtitle="Native-like App" color="blue" />
-              </div>
-            </Card>
-          </div>
-
-          {/* Right Column: Dynamic Operation */}
-          <div className="lg:col-span-7 space-y-6">
-            <h2 className="text-xl font-bold text-slate-800 border-b-2 border-slate-200 pb-2 flex items-center gap-2">
-              <Activity className="w-6 h-6 text-blue-500" />
-              Dynamic Operation
-            </h2>
-
-            <div className="relative p-6 md:p-8 bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden">
-              {/* Background decorative elements */}
-              <div className="absolute top-0 right-0 w-96 h-96 bg-blue-50 rounded-full blur-3xl -mr-48 -mt-48 opacity-60 pointer-events-none"></div>
-              <div className="absolute bottom-0 left-0 w-96 h-96 bg-emerald-50 rounded-full blur-3xl -ml-48 -mb-48 opacity-60 pointer-events-none"></div>
-
-              {/* Top Section: AI Flow */}
-              <div className="flex flex-col md:flex-row items-center justify-between gap-4 mb-12 relative z-10">
-                <div className="flex flex-col items-center w-full md:w-auto">
-                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Human Input</h4>
-                  <StepNode icon={MessageSquare} title="Chat Interface" subtitle="Text Input" color="amber" className="w-full md:w-auto" />
+              <button 
+                onClick={() => setIsSidebarOpen(false)}
+                className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white transition-colors"
+              >
+                <PanelLeftClose className="w-4 h-4" />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {sources.length === 0 ? (
+                <div className="text-center text-slate-500 text-sm py-8 px-4 border border-dashed border-slate-700 rounded-lg">
+                  No sources added yet. Add a source to give the AI context.
                 </div>
-                
-                <FlowArrow direction="right" className="hidden md:flex" />
-                <FlowArrow direction="down" className="md:hidden my-2" />
-                
-                <div className="flex flex-col items-center w-full md:w-auto">
-                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">AI Processing</h4>
-                  <StepNode icon={BrainCircuit} title="AI Agent" subtitle="Claude/ChatGPT/Open Claw" color="indigo" className="w-full md:w-auto" />
-                </div>
-                
-                <FlowArrow direction="right" className="hidden md:flex" />
-                <FlowArrow direction="down" className="md:hidden my-2" />
-                
-                <div className="flex flex-col gap-2 w-full md:w-auto">
-                  <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2 text-center md:text-left">Background Tasks</h4>
-                  <div className="bg-slate-50 px-3 py-2 rounded-lg text-xs font-medium text-slate-600 border border-slate-200 flex items-center gap-2 shadow-sm">
-                    <Eye className="w-4 h-4 text-indigo-500" /> Pattern Recognition
-                  </div>
-                  <div className="bg-slate-50 px-3 py-2 rounded-lg text-xs font-medium text-slate-600 border border-slate-200 flex items-center gap-2 shadow-sm">
-                    <Activity className="w-4 h-4 text-emerald-500" /> Autonomous Monitoring
-                  </div>
-                </div>
-              </div>
-
-              {/* Center Section: Database & MCP */}
-              <div className="flex flex-col items-center justify-center relative z-10 my-12">
-                <div className="flex flex-col items-center mb-6 relative">
-                  <div className="absolute inset-0 bg-emerald-100 blur-xl rounded-full opacity-50"></div>
-                  <div className="relative flex items-center gap-2 bg-slate-800 text-white px-6 py-3 rounded-full text-sm font-bold shadow-lg border border-slate-700 z-10">
-                    <Lock className="w-5 h-5 text-emerald-400" />
-                    MCP Server (Secure Bridge)
-                  </div>
-                  
-                  <div className="flex justify-between w-48 text-slate-500 font-bold my-4 relative z-10">
-                    <div className="flex flex-col items-center">
-                      <span className="text-[10px] uppercase tracking-wider">Query</span>
-                      <span className="text-xl">↓</span>
-                    </div>
-                    <div className="flex flex-col items-center">
-                      <span className="text-xl">↑</span>
-                      <span className="text-[10px] uppercase tracking-wider">Write</span>
-                    </div>
-                  </div>
-                </div>
-
-                <motion.div 
-                  animate={{ boxShadow: ['0px 0px 0px rgba(16, 185, 129, 0)', '0px 0px 30px rgba(16, 185, 129, 0.4)', '0px 0px 0px rgba(16, 185, 129, 0)'] }}
-                  transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
-                  className="bg-emerald-50 border-2 border-emerald-400 rounded-2xl p-8 text-center max-w-md w-full shadow-xl relative z-20"
-                >
-                  <Database className="w-16 h-16 text-emerald-600 mx-auto mb-3 drop-shadow-sm" />
-                  <h3 className="text-2xl font-extrabold text-emerald-900 tracking-tight">Supabase Database</h3>
-                  <p className="text-xs text-emerald-600 font-bold uppercase tracking-widest mb-6 bg-emerald-100 inline-block px-3 py-1 rounded-full">&quot;Single Source of Truth&quot;</p>
-                  
-                  <div className="grid grid-cols-2 gap-3 text-xs font-medium">
-                    <div className="bg-white border border-emerald-200 rounded-lg p-3 text-emerald-800 shadow-sm flex items-center justify-center">Household Info</div>
-                    <div className="bg-white border border-emerald-200 rounded-lg p-3 text-emerald-800 shadow-sm flex items-center justify-center">Professional Relations</div>
-                    <div className="bg-white border border-emerald-200 rounded-lg p-3 text-emerald-800 shadow-sm flex items-center justify-center">Job Hunt</div>
-                    <div className="bg-white border border-emerald-200 rounded-lg p-3 text-emerald-800 shadow-sm flex items-center justify-center">Maintenance</div>
-                  </div>
-                </motion.div>
-              </div>
-
-              {/* Bottom Section: Human UI Flow */}
-              <div className="mt-16 relative z-10 bg-slate-50 rounded-2xl p-6 border border-slate-200">
-                <h4 className="text-center text-sm font-bold text-slate-500 uppercase tracking-widest mb-6">Human Interaction Flow</h4>
-                
-                <div className="flex flex-col md:flex-row items-center justify-center gap-8 md:gap-12">
-                  <div className="flex flex-col items-center">
-                    <div className="flex gap-4 mb-4 text-slate-400 font-bold">
-                      <div className="flex flex-col items-center">
-                        <span className="text-xl">↑</span>
-                        <span className="text-[10px] uppercase tracking-wider">Fetches State</span>
+              ) : (
+                sources.map((source) => (
+                  <div key={source.id} className="bg-slate-800 rounded-lg p-3 border border-slate-700 group relative">
+                    <div className="flex items-start gap-3">
+                      <FileText className="w-4 h-4 text-emerald-400 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <h4 className="text-sm font-medium text-slate-200 truncate">{source.title}</h4>
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wider mt-1">{source.content.length} chars</p>
                       </div>
-                      <div className="flex flex-col items-center">
-                        <span className="text-[10px] uppercase tracking-wider">Updates Data</span>
-                        <span className="text-xl">↓</span>
-                      </div>
-                    </div>
-                    
-                    <div className="relative">
-                      <div className="absolute -top-3 -left-3 bg-blue-600 text-white text-[10px] font-bold px-3 py-1 rounded-full z-20 shadow-md uppercase tracking-wider">
-                        Human Door
-                      </div>
-                      <StepNode icon={LayoutTemplate} title="Web App Dashboard" subtitle="Native-like Experience" color="blue" className="w-48" />
+                      <button 
+                        onClick={() => removeSource(source.id)}
+                        className="opacity-0 group-hover:opacity-100 p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400 transition-all"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   </div>
-                  
-                  <div className="flex flex-col gap-2 items-center">
-                    <FlowArrow direction="right" className="hidden md:flex" />
-                    <FlowArrow direction="down" className="md:hidden" />
-                    <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider bg-white px-2 py-1 rounded border shadow-sm">Visualizes Data</span>
-                  </div>
-
-                  <div className="flex flex-col items-center">
-                    <StepNode icon={User} title="User Interaction" subtitle="Tap, Edit, View" color="amber" className="w-40" />
-                  </div>
-                </div>
-              </div>
+                ))
+              )}
             </div>
 
-            {/* Example Loop Card */}
-            <Card className="bg-slate-900 text-white border-slate-800 shadow-xl">
-              <h3 className="text-sm font-bold text-blue-400 uppercase tracking-wider mb-6 flex items-center gap-2 border-b border-slate-700 pb-3">
-                <RefreshCw className="w-5 h-5" />
-                Example: Networking Loop
-              </h3>
-              <ol className="space-y-4 text-sm text-slate-300">
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-600 text-white flex items-center justify-center text-xs font-bold shadow-md">1</span>
-                  <span className="pt-1">User texts <strong className="text-white bg-slate-800 px-2 py-0.5 rounded border border-slate-700">&quot;Save new contact James&quot;</strong> to AI.</span>
-                </li>
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shadow-md">2</span>
-                  <span className="pt-1">AI saves to Supabase database via MCP.</span>
-                </li>
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs font-bold shadow-md">3</span>
-                  <span className="pt-1">Human opens Web App Dashboard on phone.</span>
-                </li>
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shadow-md">4</span>
-                  <span className="pt-1">Human sees visual cue <strong className="text-white bg-slate-800 px-2 py-0.5 rounded border border-slate-700">&quot;James going cold&quot;</strong>.</span>
-                </li>
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-amber-500 text-white flex items-center justify-center text-xs font-bold shadow-md">5</span>
-                  <span className="pt-1">Human edits status to <strong className="text-white bg-slate-800 px-2 py-0.5 rounded border border-slate-700">&quot;Contacted&quot;</strong> in the app.</span>
-                </li>
-                <li className="flex gap-4 items-start">
-                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-bold shadow-md">6</span>
-                  <span className="pt-1">App updates Supabase; AI Agent is instantly informed for next chat.</span>
-                </li>
-              </ol>
-            </Card>
+            <div className="p-4 border-t border-slate-800">
+              <button 
+                onClick={() => setIsAddSourceOpen(true)}
+                className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white py-2 px-4 rounded-lg text-sm font-medium transition-colors shadow-sm"
+              >
+                <Plus className="w-4 h-4" /> Add Source
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* --- Main Workspace --- */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Header */}
+        <header className="h-14 bg-white border-b border-slate-200 flex items-center px-4 justify-between flex-shrink-0 z-10">
+          <div className="flex items-center gap-3">
+            {!isSidebarOpen && (
+              <button 
+                onClick={() => setIsSidebarOpen(true)}
+                className="p-1.5 hover:bg-slate-100 rounded-md text-slate-500 transition-colors"
+              >
+                <PanelLeftOpen className="w-5 h-5" />
+              </button>
+            )}
+            <h1 className="font-bold text-slate-800 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-500" />
+              Context Engine
+            </h1>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 rounded-md border border-slate-200 text-xs text-slate-500 font-medium">
+              <Search className="w-3.5 h-3.5" />
+              <span>Cmd + K</span>
+            </div>
+          </div>
+        </header>
+
+        {/* Split Pane */}
+        <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
+          
+          {/* Left: Editor */}
+          <div className="flex-1 flex flex-col border-r border-slate-200 bg-white min-w-0">
+            <div className="h-10 border-b border-slate-100 flex items-center px-4 bg-slate-50/50">
+              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                <FileCode className="w-3.5 h-3.5" /> Output Document
+              </span>
+            </div>
+            <textarea
+              value={editorContent}
+              onChange={(e) => setEditorContent(e.target.value)}
+              className="flex-1 w-full p-6 resize-none focus:outline-none text-slate-700 font-mono text-sm leading-relaxed"
+              placeholder="Start typing your document here..."
+            />
+          </div>
+
+          {/* Right: Chat */}
+          <div className="flex-1 flex flex-col bg-slate-50 min-w-0 md:max-w-lg lg:max-w-xl">
+            <div className="h-10 border-b border-slate-200 flex items-center px-4 bg-white">
+              <span className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+                <MessageSquare className="w-3.5 h-3.5" /> Assistant
+              </span>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-4 space-y-6">
+              {chatHistory.map((msg) => (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+                    msg.role === 'user' 
+                      ? 'bg-indigo-600 text-white rounded-tr-sm shadow-sm' 
+                      : 'bg-white border border-slate-200 text-slate-800 rounded-tl-sm shadow-sm'
+                  }`}>
+                    {msg.role === 'user' ? (
+                      <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+                    ) : (
+                      <div className="prose prose-sm prose-slate max-w-none prose-p:leading-relaxed prose-pre:bg-slate-800 prose-pre:text-slate-100">
+                        <Markdown remarkPlugins={[remarkGfm]}>{msg.text}</Markdown>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {isChatLoading && (
+                <div className="flex justify-start">
+                  <div className="bg-white border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm flex items-center gap-2 text-slate-500">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span className="text-sm">Thinking...</span>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            <div className="p-4 bg-white border-t border-slate-200">
+              <form onSubmit={handleSendMessage} className="relative flex items-center">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Ask about your sources..."
+                  className="w-full pl-4 pr-12 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm transition-all shadow-sm"
+                  disabled={isChatLoading}
+                />
+                <button
+                  type="submit"
+                  disabled={!chatInput.trim() || isChatLoading}
+                  className="absolute right-2 p-2 text-white bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-300 disabled:text-slate-500 rounded-lg transition-colors"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </form>
+            </div>
           </div>
         </div>
       </div>
+
+      {/* --- Modals --- */}
+      
+      {/* Command Palette Modal */}
+      <AnimatePresence>
+        {isCommandPaletteOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-40"
+              onClick={() => setIsCommandPaletteOpen(false)}
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: -20 }} 
+              animate={{ opacity: 1, scale: 1, y: 0 }} 
+              exit={{ opacity: 0, scale: 0.95, y: -20 }}
+              className="fixed top-[20%] left-1/2 -translate-x-1/2 w-full max-w-lg bg-white rounded-2xl shadow-2xl border border-slate-200 z-50 overflow-hidden flex flex-col max-h-[60vh]"
+            >
+              <div className="p-4 border-b border-slate-100 flex items-center gap-3">
+                <Search className="w-5 h-5 text-slate-400" />
+                <input 
+                  ref={commandInputRef}
+                  type="text" 
+                  placeholder="Type a command or search..." 
+                  className="flex-1 bg-transparent border-none focus:outline-none text-slate-800 placeholder:text-slate-400"
+                />
+                <div className="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-1 rounded uppercase tracking-wider">ESC</div>
+              </div>
+              <div className="p-2 overflow-y-auto">
+                <div className="px-3 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider">AI Actions</div>
+                {commands.map((cmd) => (
+                  <button
+                    key={cmd.id}
+                    onClick={cmd.action}
+                    className="w-full flex items-center gap-3 px-3 py-3 hover:bg-slate-50 rounded-xl text-left transition-colors group"
+                  >
+                    <div className="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center group-hover:bg-indigo-100 transition-colors">
+                      <cmd.icon className="w-4 h-4" />
+                    </div>
+                    <span className="text-sm font-medium text-slate-700 group-hover:text-slate-900">{cmd.title}</span>
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Add Source Modal */}
+      <AnimatePresence>
+        {isAddSourceOpen && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-40"
+              onClick={() => setIsAddSourceOpen(false)}
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }} 
+              animate={{ opacity: 1, scale: 1 }} 
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-2xl bg-white rounded-2xl shadow-2xl border border-slate-200 z-50 overflow-hidden flex flex-col"
+            >
+              <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                  <Database className="w-5 h-5 text-indigo-500" /> Add Context Source
+                </h2>
+                <button onClick={() => setIsAddSourceOpen(false)} className="p-1 text-slate-400 hover:text-slate-600 rounded-md hover:bg-slate-100">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <form onSubmit={handleAddSource} className="p-6 flex flex-col gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">Source Title</label>
+                  <input 
+                    type="text" 
+                    required
+                    value={newSourceTitle}
+                    onChange={(e) => setNewSourceTitle(e.target.value)}
+                    placeholder="e.g., Next.js App Router Docs" 
+                    className="w-full px-4 py-2 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">Content (Text or Markdown)</label>
+                  <textarea 
+                    required
+                    value={newSourceContent}
+                    onChange={(e) => setNewSourceContent(e.target.value)}
+                    placeholder="Paste your transcript, documentation, or notes here..." 
+                    className="w-full h-64 px-4 py-3 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-sm font-mono resize-none"
+                  />
+                </div>
+                <div className="flex justify-end gap-3 mt-2">
+                  <button 
+                    type="button" 
+                    onClick={() => setIsAddSourceOpen(false)}
+                    className="px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit"
+                    className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors shadow-sm flex items-center gap-2"
+                  >
+                    <Check className="w-4 h-4" /> Save Source
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
     </div>
+  );
+}
+
+// Simple Database icon component since it wasn't imported from lucide-react in the main list
+function Database(props: any) {
+  return (
+    <svg
+      {...props}
+      xmlns="http://www.w3.org/2000/svg"
+      width="24"
+      height="24"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <ellipse cx="12" cy="5" rx="9" ry="3" />
+      <path d="M3 5V19A9 3 0 0 0 21 19V5" />
+      <path d="M3 12A9 3 0 0 0 21 12" />
+    </svg>
   );
 }

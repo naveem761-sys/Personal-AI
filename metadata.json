@@ -1,5 +1,5 @@
 {
-  "name": "Open Brain Architecture",
-  "description": "Interactive visualization of the Open Brain System Architecture and Flow.",
+  "name": "Context Engine",
+  "description": "A split-pane workspace with proactive AI retrieval, source management, and a Command Palette for high-velocity workflows.",
   "requestFramePermissions": []
 }
